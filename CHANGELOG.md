@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Updated the Prometheus buckets for `grpc_server_handling_seconds` and `spicedb_datastore_query_latency` to be able to correlate them (https://github.com/authzed/spicedb/pull/3188)
 
 ### Fixed
+- Fixed a nil pointer dereference panic in `CheckBulkPermissions` that could occur under concurrent load when a tracing-enabled check shared a singleflight dispatch with a non-tracing bulk check. Debug-enabled checks are no longer singleflighted together with non-debug checks. (https://github.com/authzed/spicedb/pull/3174)
 - When SpiceDB loses a connection to a CockroachDB node, every read happening in the server blocks for a short period of time (https://github.com/authzed/spicedb/pull/3181)
 - LSP: hover and go-to-definition now resolve identifiers on the right-hand side of arrow expressions (`->`, `.any(...)`, `.all(...)`) (https://github.com/authzed/spicedb/pull/3157)
 - The `in_cidr` caveat now matches IPv4-mapped IPv6 addresses (e.g. `::ffff:10.1.2.3`) against IPv4 CIDRs, the same as the dotted form (https://github.com/authzed/spicedb/pull/3184)
