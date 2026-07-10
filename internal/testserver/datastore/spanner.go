@@ -2,7 +2,7 @@ package datastore
 
 import (
 	"context"
-	"fmt"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -11,10 +11,9 @@ import (
 	adminpb "cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	instances "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
-	"github.com/google/uuid"
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/authzed/spicedb/internal/datastore/spanner/migrations"
 	"github.com/authzed/spicedb/pkg/datastore"
@@ -29,44 +28,39 @@ type spannerTest struct {
 }
 
 // RunSpannerForTesting returns a RunningEngineForTest for spanner
-func RunSpannerForTesting(t testing.TB, bridgeNetworkName string, targetMigration string) RunningEngineForTest {
-	pool, err := dockertest.NewPool("")
+func RunSpannerForTesting(t testing.TB, targetMigration string, opts ...testcontainers.ContainerCustomizer) RunningEngineForTest {
+	ctx := t.Context()
+
+	options := make([]testcontainers.ContainerCustomizer, 0, len(opts)+2)
+	options = append(options,
+		testcontainers.WithExposedPorts("9010/tcp"),
+		testcontainers.WithWaitStrategy(wait.ForListeningPort("9010/tcp").WithStartupTimeout(time.Minute)),
+	)
+	options = append(options, opts...)
+
+	container, err := testcontainers.Run(ctx, "gcr.io/cloud-spanner-emulator/emulator:1.5.41",
+		options...,
+	)
+	require.NoError(t, err)
+	testcontainers.CleanupContainer(t, container)
+
+	host, err := container.Host(ctx)
+	require.NoError(t, err)
+	mappedPort, err := container.MappedPort(ctx, "9010/tcp")
 	require.NoError(t, err)
 
-	name := "spanner-" + uuid.New().String()
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Name:         name,
-		Repository:   "gcr.io/cloud-spanner-emulator/emulator",
-		Tag:          "1.5.41",
-		ExposedPorts: []string{"9010/tcp"},
-		NetworkID:    bridgeNetworkName,
-	}, func(config *docker.HostConfig) {
-		// set AutoRemove to true so that stopped container goes away by itself
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-	})
-	require.NoError(t, err)
+	// The Spanner client libraries read SPANNER_EMULATOR_HOST, so it must be set
+	// before any admin client is created below.
+	t.Setenv("SPANNER_EMULATOR_HOST", net.JoinHostPort(host, mappedPort.Port()))
 
-	t.Cleanup(func() {
-		require.NoError(t, pool.Purge(resource))
-	})
-
-	port := resource.GetPort("9010/tcp")
-	spannerEmulatorAddr := "localhost:" + port
-	t.Setenv("SPANNER_EMULATOR_HOST", spannerEmulatorAddr)
-
-	require.NoError(t, pool.Retry(func() error {
-		ctx, cancel := context.WithTimeout(t.Context(), dockerBootTimeout)
-		defer cancel()
-
+	// Wait until the emulator's admin API is responsive by creating an initial instance.
+	require.Eventually(t, func() bool {
 		instancesClient, err := instances.NewInstanceAdminClient(ctx)
 		if err != nil {
-			return err
+			return false
 		}
-		defer func() { require.NoError(t, instancesClient.Close()) }()
+		defer instancesClient.Close()
 
-		ctx, cancel = context.WithTimeout(t.Context(), dockerBootTimeout)
-		defer cancel()
 		_, err = instancesClient.CreateInstance(ctx, &instancepb.CreateInstanceRequest{
 			Parent:     "projects/fake-project-id",
 			InstanceId: "init",
@@ -76,25 +70,15 @@ func RunSpannerForTesting(t testing.TB, bridgeNetworkName string, targetMigratio
 				NodeCount:   1,
 			},
 		})
-		return err
-	}))
+		return err == nil
+	}, time.Minute, 500*time.Millisecond)
 
 	builder := &spannerTest{
+		hostname:        host,
+		port:            mappedPort.Port(),
 		targetMigration: targetMigration,
 	}
-	if bridgeNetworkName != "" {
-		builder.hostname = name
-		builder.port = "9010"
-	} else {
-		builder.hostname = "localhost"
-		builder.port = port
-	}
-
 	return builder
-}
-
-func (b *spannerTest) ExternalEnvVars() []string {
-	return []string{fmt.Sprintf("SPANNER_EMULATOR_HOST=%s:%s", b.hostname, b.port)}
 }
 
 func (b *spannerTest) NewDatabase(t testing.TB) string {
